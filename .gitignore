@@ -1,0 +1,32 @@
+# Environment
+.env
+graphrag-env/
+venv/
+*.env
+
+# Kuzu Database
+graphrag.db
+*.db
+
+# PDFs — large binaries, not tracked in git
+*.pdf
+sample_pdfs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# VSCode
+.vscode/
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
