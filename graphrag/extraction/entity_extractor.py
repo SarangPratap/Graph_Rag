@@ -1,4 +1,4 @@
-"""Extract entities and relations from text chunks using Sarvam AI."""
+"""Extract entities and relations from text chunks using Sarvam AI (two-turn strategy)."""
 
 from __future__ import annotations
 
@@ -23,37 +23,68 @@ sarvam = OpenAI(
 
 _VALID_TYPES = {"PERSON", "ORG", "CONCEPT", "LOCATION", "EVENT"}
 
-_PROMPT_TEMPLATE = """You are an expert data extraction algorithm. Read the text below and extract every entity and relationship you find.
+# Turn 1 — free reasoning, no format pressure
+_EXTRACTION_PROMPT = """You are an expert knowledge extraction system. Carefully read the text below and identify:
+- Every named entity (people, organizations, concepts, locations, events)
+- Every meaningful relationship between those entities
 
-As you work through the text, for every entity you identify immediately write it as a standalone JSON object on its own line:
-{"name": "Entity Name", "type": "PERSON|ORG|CONCEPT|LOCATION|EVENT", "description": "brief description"}
-
-For every relationship between two entities, write:
-{"source": "Entity A", "target": "Entity B", "relationship": "how they are connected"}
-
-Do not write a final summary or wrap anything in arrays. Just emit one JSON object per line as you discover each item.
+Think through the text thoroughly. There is no output format required — just reason carefully.
 
 Text:
 {text_chunk}"""
 
+# Turn 2 — model sees its own reasoning, just formats the final answer
+_FORMAT_PROMPT = """Based on your analysis above, output ONLY the following JSON object with no explanation, no markdown, no extra text:
+
+{
+  "entities": [
+    {"name": "Entity Name", "type": "PERSON|ORG|CONCEPT|LOCATION|EVENT", "description": "brief description"}
+  ],
+  "relations": [
+    {"source": "Entity A", "target": "Entity B", "relationship": "how they connect"}
+  ]
+}
+
+Use only these entity types: PERSON, ORG, CONCEPT, LOCATION, EVENT."""
+
 
 def extract(chunk: Chunk) -> ExtractionResult:
-    """Extract entities and relations from a single Chunk via Sarvam AI.
+    """Extract entities and relations from a single Chunk using a two-turn Sarvam conversation.
 
+    Turn 1 lets the model reason freely. Turn 2 asks it to format its findings as
+    clean JSON — short response, no token pressure, reliable output.
     Returns an ExtractionResult with empty lists on any failure.
     """
     try:
-        prompt = _build_prompt(chunk.text)
-        response = sarvam.chat.completions.create(
+        extraction_prompt = _EXTRACTION_PROMPT.replace("{text_chunk}", chunk.text)
+
+        # Turn 1: reason freely about the text
+        resp1 = sarvam.chat.completions.create(
             model="sarvam-30b",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": extraction_prompt}],
             max_tokens=4096,
             extra_body={"reasoning_effort": "low"},
         )
-        msg = response.choices[0].message
-        raw = msg.content or getattr(msg, "reasoning_content", None) or ""
-        parsed = _parse_response(raw)
+        msg1 = resp1.choices[0].message
+        thinking = msg1.content or getattr(msg1, "reasoning_content", None) or ""
+
+        # Turn 2: convert reasoning into final JSON
+        resp2 = sarvam.chat.completions.create(
+            model="sarvam-30b",
+            messages=[
+                {"role": "user",      "content": extraction_prompt},
+                {"role": "assistant", "content": thinking},
+                {"role": "user",      "content": _FORMAT_PROMPT},
+            ],
+            max_tokens=4096,
+            extra_body={"reasoning_effort": "low"},
+        )
+        msg2 = resp2.choices[0].message
+        raw = msg2.content or getattr(msg2, "reasoning_content", None) or ""
+
+        parsed = _parse_json(raw)
         return _build_result(chunk, parsed)
+
     except Exception as exc:
         logger.error("Extraction failed for chunk %s: %s", chunk.id, exc)
         return ExtractionResult(chunk_id=chunk.id)
@@ -69,47 +100,47 @@ def extract_batch(chunks: list[Chunk]) -> list[ExtractionResult]:
     return results
 
 
-def _build_prompt(text: str) -> str:
-    """Return the extraction prompt with chunk text interpolated."""
-    return _PROMPT_TEMPLATE.replace("{text_chunk}", text)
+def _parse_json(raw: str) -> dict:
+    """Strip fences and <think> tags, then parse the first balanced JSON object."""
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    text = text.replace("```json", "").replace("```", "").strip()
 
+    # Find the outermost { ... } that contains "entities"
+    start = text.find('{"entities"')
+    if start == -1:
+        start = text.find('{')
+    if start == -1:
+        logger.warning("No JSON object found in response")
+        return {"entities": [], "relations": []}
 
-_PLACEHOLDER_NAMES = {"Entity Name", "Entity A", "Entity B", "Source Name", "Target Name", "Clean Entity Name"}
-
-
-def _parse_response(raw: str) -> dict:
-    """Harvest flat JSON objects from reasoning_content using the per-item strategy.
-
-    Deduplicates by name/source+target so repeated drafts in reasoning don't inflate counts.
-    """
-    seen_entities: set[str] = set()
-    seen_relations: set[tuple] = set()
-    entities: list[dict] = []
-    relations: list[dict] = []
-
-    for m in re.finditer(r"\{[^{}]+\}", raw, re.DOTALL):
-        try:
-            obj = json.loads(m.group())
-        except json.JSONDecodeError:
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
             continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError as exc:
+                    logger.warning("JSON parse failed: %s", exc)
+                    return {"entities": [], "relations": []}
 
-        if {"name", "type", "description"} <= obj.keys():
-            name = str(obj["name"]).strip()
-            if name in _PLACEHOLDER_NAMES or name in seen_entities:
-                continue
-            seen_entities.add(name)
-            entities.append(obj)
-
-        elif {"source", "target", "relationship"} <= obj.keys():
-            src = str(obj["source"]).strip()
-            tgt = str(obj["target"]).strip()
-            key = (src, tgt)
-            if src in _PLACEHOLDER_NAMES or tgt in _PLACEHOLDER_NAMES or key in seen_relations:
-                continue
-            seen_relations.add(key)
-            relations.append(obj)
-
-    return {"entities": entities, "relations": relations}
+    logger.warning("Unbalanced JSON in response")
+    return {"entities": [], "relations": []}
 
 
 def _build_result(chunk: Chunk, parsed: dict) -> ExtractionResult:
