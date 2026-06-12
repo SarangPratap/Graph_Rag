@@ -1,3 +1,6 @@
+# Internal dev context — not for public repo
+CLAUDE.md
+
 # Environment
 .env
 graphrag-env/
