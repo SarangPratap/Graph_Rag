@@ -65,7 +65,7 @@ def main() -> None:
     count = client.count(collection_name="chunks").count
     print(f"  Chunk count still {count} (no duplicates)")
 
-    print("\nPhase 5 complete.")
+    print("\nAll vector store tests passed.")
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ def main() -> None:
         shutil.rmtree(TEST_DB)
     elif os.path.isfile(TEST_DB):
         os.remove(TEST_DB)
-    print("\nPhase 4 complete.")
+    print("\nAll graph store tests passed.")
 
 
 if __name__ == "__main__":
