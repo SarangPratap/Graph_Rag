@@ -7,7 +7,7 @@ import logging
 from dotenv import load_dotenv
 from prefect import flow, task
 
-from graphrag.extraction.entity_extractor import extract
+from graphrag.extraction.entity_extractor import extract_batch_parallel
 from graphrag.extraction.entity_resolver import resolve_entities
 from graphrag.graph.store import (
     get_connection,
@@ -53,12 +53,8 @@ def chunk_documents(documents: list[Document]) -> list[Chunk]:
 
 @task
 def extract_entities(chunks: list[Chunk]) -> list[ExtractionResult]:
-    """Run entity extraction on every chunk via Sarvam AI."""
-    total = len(chunks)
-    results: list[ExtractionResult] = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Extracting chunk {i}/{total} ...")
-        results.append(extract(chunk))
+    """Run entity extraction on all chunks in parallel (5 workers)."""
+    results = extract_batch_parallel(chunks, max_workers=5)
     total_ents = sum(len(r.entities) for r in results)
     total_rels = sum(len(r.relations) for r in results)
     print(f"Extracted {total_ents} entities and {total_rels} relations")

@@ -23,7 +23,7 @@ def _get_hybrid_chunker():
         from docling.chunking import HybridChunker
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-        _hybrid_chunker = HybridChunker(tokenizer=tokenizer, max_tokens=100, merge_peers=True)
+        _hybrid_chunker = HybridChunker(tokenizer=tokenizer, max_tokens=400, merge_peers=True)
         logger.info("HybridChunker initialised with max_tokens=100")
     return _hybrid_chunker
 

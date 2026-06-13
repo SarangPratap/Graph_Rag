@@ -48,7 +48,14 @@ def _to_uuid(hex_id: str) -> str:
 
 
 def get_client() -> QdrantClient:
-    """Return a Qdrant client connected using QDRANT_HOST and QDRANT_PORT from env."""
+    """Return a Qdrant client.
+
+    Prefers QDRANT_URL + optional QDRANT_API_KEY (Qdrant Cloud).
+    Falls back to QDRANT_HOST / QDRANT_PORT for local Docker.
+    """
+    url = os.environ.get("QDRANT_URL")
+    if url:
+        return QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
     host = os.environ.get("QDRANT_HOST", "localhost")
     port = int(os.environ.get("QDRANT_PORT", 6333))
     return QdrantClient(host=host, port=port)

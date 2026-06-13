@@ -1,3 +1,13 @@
+---
+title: GraphRAG API
+emoji: 🔍
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # GraphRAG — Graph-Enhanced Retrieval-Augmented Generation
 
 A production-grade knowledge graph + vector search pipeline that answers complex, multi-hop questions over large document collections.
@@ -245,12 +255,62 @@ This project uses a **harvest strategy**:
 | 1 | `ingestion/pdf_loader.py` | ✅ Complete |
 | 2 | `ingestion/chunker.py` | ✅ Complete |
 | 3 | `extraction/entity_extractor.py` | ✅ Complete |
-| 4 | `graph/schema.py` + `graph/store.py` | 🔲 In progress |
-| 5 | `vector/store.py` | 🔲 Pending |
-| 6 | `flows/ingest_flow.py` | 🔲 Pending |
-| 7 | `ingestion/web_crawler.py` | 🔲 Pending |
-| 8 | `query/planner.py` | 🔲 Pending |
-| 9 | FastAPI endpoint | 🔲 Pending |
+| 4 | `graph/schema.py` + `graph/store.py` | ✅ Complete |
+| 5 | `vector/store.py` | ✅ Complete |
+| 6 | `flows/ingest_flow.py` | ✅ Complete |
+| 7 | `ingestion/web_crawler.py` | ✅ Complete |
+| 8 | `query/planner.py` | ✅ Complete |
+| 9 | FastAPI endpoint (`main.py`) | ✅ Complete |
+
+---
+
+## Deploying to Hugging Face Spaces
+
+### 1. Set up Qdrant Cloud (free tier)
+Create a cluster at [cloud.qdrant.io](https://cloud.qdrant.io) and note your **cluster URL** and **API key**.
+
+### 2. Ingest your documents locally against Qdrant Cloud
+```bash
+# Point at Qdrant Cloud in your local .env
+QDRANT_URL=https://your-cluster.qdrant.tech
+QDRANT_API_KEY=your_qdrant_api_key
+
+python -c "from graphrag.flows.ingest_flow import ingest_flow; ingest_flow('./sample_pdfs')"
+```
+This populates Qdrant Cloud with embeddings and fills `./graphrag.db` (Kuzu) locally.
+
+### 3. Commit the Kuzu database
+```bash
+git add graphrag.db
+git commit -m "add pre-populated kuzu graph db"
+```
+
+### 4. Create and push the HF Space
+```bash
+# Create the Space on huggingface.co (Docker SDK, public)
+# Then add it as a remote and push
+git remote add space https://huggingface.co/spaces/<your-username>/graphrag-api
+git push space master
+```
+
+### 5. Set Space secrets
+In your Space → **Settings → Variables and secrets**, add:
+
+| Secret | Value |
+|--------|-------|
+| `SARVAM_API_KEY` | your Sarvam key |
+| `QDRANT_URL` | `https://your-cluster.qdrant.tech` |
+| `QDRANT_API_KEY` | your Qdrant Cloud key |
+| `KUZU_DB_PATH` | `./graphrag.db` |
+
+### 6. Test the live endpoint
+```bash
+curl -X POST https://<your-username>-graphrag-api.hf.space/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the main contribution of this paper?"}'
+```
+
+Interactive docs available at: `https://<your-username>-graphrag-api.hf.space/docs`
 
 ---
 

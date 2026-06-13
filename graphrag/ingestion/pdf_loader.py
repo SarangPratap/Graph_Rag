@@ -6,7 +6,9 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from dotenv import load_dotenv
 
 from graphrag.models import Document
@@ -15,7 +17,20 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_converter = DocumentConverter()
+# Disable OCR for native-text PDFs (academic papers, reports, etc.).
+# OCR loads RapidOCR + image tensors per page — on high-res pages this causes
+# std::bad_alloc crashes and adds minutes of unnecessary processing time.
+# For scanned-image PDFs the text will still be extracted via Docling's layout
+# model; only hand-written or very low-quality scans truly need OCR.
+_pipeline_options = PdfPipelineOptions()
+_pipeline_options.do_ocr = False
+_pipeline_options.do_table_structure = False  # also renders page images → bad_alloc on large pages
+
+_converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_options=_pipeline_options)
+    }
+)
 
 # Cache of source_path → DoclingDocument so chunker can use HybridChunker
 # without re-loading the PDF.

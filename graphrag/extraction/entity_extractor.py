@@ -83,6 +83,25 @@ def extract(chunk: Chunk) -> ExtractionResult:
         raw = msg2.content or getattr(msg2, "reasoning_content", None) or ""
 
         parsed = _parse_json(raw)
+
+        # If parsing yielded nothing, retry turn 2 once — the model occasionally
+        # buries the JSON inside another reasoning block on the first attempt.
+        if not parsed.get("entities") and not parsed.get("relations"):
+            logger.warning("Empty parse for chunk %s — retrying turn 2", chunk.id)
+            resp2b = sarvam.chat.completions.create(
+                model="sarvam-30b",
+                messages=[
+                    {"role": "user",      "content": extraction_prompt},
+                    {"role": "assistant", "content": thinking},
+                    {"role": "user",      "content": _FORMAT_PROMPT},
+                ],
+                max_tokens=4096,
+                extra_body={"reasoning_effort": "low"},
+            )
+            msg2b = resp2b.choices[0].message
+            raw = msg2b.content or getattr(msg2b, "reasoning_content", None) or ""
+            parsed = _parse_json(raw)
+
         return _build_result(chunk, parsed)
 
     except Exception as exc:
@@ -91,7 +110,7 @@ def extract(chunk: Chunk) -> ExtractionResult:
 
 
 def extract_batch(chunks: list[Chunk]) -> list[ExtractionResult]:
-    """Extract entities and relations from every Chunk in the list."""
+    """Extract entities and relations from every Chunk in the list (sequential)."""
     total = len(chunks)
     results: list[ExtractionResult] = []
     for i, chunk in enumerate(chunks, 1):
@@ -100,47 +119,128 @@ def extract_batch(chunks: list[Chunk]) -> list[ExtractionResult]:
     return results
 
 
-def _parse_json(raw: str) -> dict:
-    """Strip fences and <think> tags, then parse the first balanced JSON object."""
-    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
-    text = text.replace("```json", "").replace("```", "").strip()
+def extract_batch_parallel(
+    chunks: list[Chunk], max_workers: int = 5
+) -> list[ExtractionResult]:
+    """Extract entities from chunks in parallel using a thread pool.
 
-    # Find the outermost { ... } that contains "entities"
+    Order of results matches the order of input chunks.
+    Failed chunks return an empty ExtractionResult so the pipeline never aborts.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    total = len(chunks)
+    results: list[ExtractionResult | None] = [None] * total
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(extract, chunk): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            completed += 1
+            print(f"Extracting chunks: {completed}/{total}", flush=True)
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                logger.error("Chunk %s failed: %s", chunks[idx].id, exc)
+                results[idx] = ExtractionResult(chunk_id=chunks[idx].id)
+
+    return [r for r in results if r is not None]
+
+
+def _clean_response(raw: str) -> str:
+    """Strip thinking tags and all code-fence variants from a model response."""
+    # Remove <think>...</think> blocks (may be unclosed — strip greedily)
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    # Fallback: if tag is unclosed, drop everything after <think>
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    # Strip code fences: ```json, ```JSON, ``` etc.
+    text = re.sub(r"```[a-zA-Z]*", "", text)
+    text = text.replace("```", "")
+    return text.strip()
+
+
+def _parse_json(raw: str) -> dict:
+    """Parse the first balanced JSON object from a model response.
+
+    Three-layer strategy:
+      1. Direct json.loads on the cleaned text (fastest, works for clean responses)
+      2. Balanced-brace walker starting at the {"entities" key
+      3. Regex salvage — extract whatever complete entity/relation objects exist
+         in a truncated or malformed response rather than discarding the whole chunk
+    """
+    text = _clean_response(raw)
+
+    # Layer 1: try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Layer 2: find and walk the outermost { ... } block
     start = text.find('{"entities"')
     if start == -1:
         start = text.find('{')
-    if start == -1:
-        logger.warning("No JSON object found in response")
-        return {"entities": [], "relations": []}
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError as exc:
+                        logger.warning("JSON parse failed after brace walk: %s", exc)
+                        break
 
-    depth = 0
-    in_string = False
-    escape_next = False
-    for i, ch in enumerate(text[start:], start):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == "\\" and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError as exc:
-                    logger.warning("JSON parse failed: %s", exc)
-                    return {"entities": [], "relations": []}
+    # Layer 3: regex salvage for truncated responses
+    logger.warning("Falling back to regex salvage on %d-char response", len(text))
+    return _salvage_json(text)
 
-    logger.warning("Unbalanced JSON in response")
-    return {"entities": [], "relations": []}
+
+def _salvage_json(text: str) -> dict:
+    """Recover individual entity and relation objects from a malformed/truncated response."""
+    entities = []
+    relations = []
+
+    # Match complete entity objects regardless of key order
+    for m in re.finditer(
+        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"([^"]+)"\s*,\s*"description"\s*:\s*"([^"]*)"\s*\}',
+        text,
+    ):
+        entities.append({"name": m.group(1), "type": m.group(2), "description": m.group(3)})
+
+    # Match complete relation objects
+    for m in re.finditer(
+        r'\{\s*"source"\s*:\s*"([^"]+)"\s*,\s*"target"\s*:\s*"([^"]+)"\s*,\s*"relationship"\s*:\s*"([^"]*)"\s*\}',
+        text,
+    ):
+        relations.append({"source": m.group(1), "target": m.group(2), "relationship": m.group(3)})
+
+    if entities or relations:
+        logger.info("Salvaged %d entities and %d relations", len(entities), len(relations))
+    else:
+        logger.warning("Salvage found nothing — chunk will have no entities")
+
+    return {"entities": entities, "relations": relations}
 
 
 def _build_result(chunk: Chunk, parsed: dict) -> ExtractionResult:
